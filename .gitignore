@@ -27,10 +27,6 @@ ENV/
 # Environment variables
 .env
 
-# Local vector store files
-*_vectors.pkl
-*_metadata.pkl
-
 # IDE
 .idea/
 .vscode/

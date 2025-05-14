@@ -1,201 +1,189 @@
-# app.py
+"""
+app.py: Main application file for the Document RAG system
+"""
+
 import os
 import streamlit as st
+from typing import List, Dict, Any
+import logging
 from dotenv import load_dotenv
-import tempfile
-
 from document_processor import DocumentProcessor
 from embeddings import EmbeddingsManager
 from pinecone_manager import PineconeManager
-from rag_engine import RAGEngine
-from utils import format_sources, format_chunks
+from langchain_openai import ChatOpenAI
+from langchain.prompts import ChatPromptTemplate
+from langchain.schema.output_parser import StrOutputParser
+from langchain.schema.runnable import RunnablePassthrough
+from langdetect import detect
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
 
-# Page configuration
-st.set_page_config(
-    page_title="Document RAG App",
-    page_icon="📚",
-    layout="wide"
+# Initialize components
+document_processor = DocumentProcessor()
+embeddings_manager = EmbeddingsManager()
+pinecone_manager = PineconeManager()
+
+# Initialize LangChain components
+llm = ChatOpenAI(
+    model="gpt-3.5-turbo",
+    temperature=0.7,
+    streaming=True
 )
 
-# Initialize components
-@st.cache_resource
-def initialize_components():
-    embeddings_manager = EmbeddingsManager()
-    from local_vector_store import LocalVectorStore
-    vector_store = LocalVectorStore()
-    rag_engine = RAGEngine(
-        embeddings_manager=embeddings_manager,
-        pinecone_manager=vector_store  # We're still using the same parameter name
-    )
-    document_processor = DocumentProcessor()
+# Define prompt templates for different languages
+prompt_templates = {
+    'en': """You are a helpful AI assistant. Use the following context to answer the question:
+
+Context: {context}
+
+Question: {question}
+
+Answer: Let me help you with that.""",
     
-    return embeddings_manager, vector_store, rag_engine, document_processor
+    'fr': """Vous êtes un assistant IA utile. Utilisez le contexte suivant pour répondre à la question :
 
-embeddings_manager, pinecone_manager, rag_engine, document_processor = initialize_components()
+Contexte : {context}
 
-# Set up the Streamlit app
-st.title("📚 Document RAG Application")
-st.markdown("Query multiple document types using AI with Retrieval Augmented Generation")
+Question : {question}
 
-# Create tabs
-tab1, tab2 = st.tabs(["💬 Chat with Documents", "📤 Upload Documents"])
-
-# Tab 1: Chat with Documents
-with tab1:
-    # Initialize chat history
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+Réponse : Je vais vous aider avec cela.""",
     
-    # Display chat messages
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-            if "sources" in message:
-                with st.expander("Sources"):
-                    st.markdown(message["sources"])
-            if "chunks" in message:
-                with st.expander("Text Chunks Used"):
-                    st.markdown(message["chunks"])
+    'es': """Eres un asistente de IA útil. Usa el siguiente contexto para responder a la pregunta:
+
+Contexto: {context}
+
+Pregunta: {question}
+
+Respuesta: Déjame ayudarte con eso.""",
     
-    # Input for new query
-    if prompt := st.chat_input("Ask a question about your documents..."):
-        # Add user message to chat history
-        st.session_state.messages.append({"role": "user", "content": prompt})
+    'de': """Sie sind ein hilfreicher KI-Assistent. Verwenden Sie den folgenden Kontext, um die Frage zu beantworten:
+
+Kontext: {context}
+
+Frage: {question}
+
+Antwort: Lassen Sie mich Ihnen dabei helfen."""
+}
+
+def get_prompt_template(text: str) -> str:
+    """Detect language and return appropriate prompt template."""
+    try:
+        lang = detect(text)
+        return prompt_templates.get(lang, prompt_templates['en'])  # Default to English if language not supported
+    except:
+        return prompt_templates['en']  # Default to English if detection fails
+
+def process_document(file_path: str) -> List[Dict[str, Any]]:
+    """Process a document and return chunks with embeddings."""
+    try:
+        # Process document
+        chunks = document_processor.process_file(file_path)
+        logger.info(f"Processed document into {len(chunks)} chunks")
         
-        # Display user message
-        with st.chat_message("user"):
-            st.markdown(prompt)
+        # Detect language from first chunk
+        if chunks:
+            doc_language = detect(chunks[0]['text'])
+            st.session_state.document_language = doc_language
+            logger.info(f"Detected document language: {doc_language}")
         
-        # Generate assistant response
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                try:
-                    # Format messages for the RAG engine
-                    messages = [
-                        {"role": msg["role"], "content": msg["content"]}
-                        for msg in st.session_state.messages
-                    ]
-                    
-                    # Process query
-                    response = rag_engine.chat(messages)
-                    
-                    # Check if response is None
-                    if response is None:
-                        st.error("No response received. The system may still be initializing or no relevant documents were found.")
-                        sources_text = "No sources available."
-                        chunks_text = "No text chunks available."
-                        response_text = "I couldn't find relevant information to answer your question. Try uploading some documents first."
-                    else:
-                        # Display response
-                        response_text = response.get("response", "No response content available.")
-                        st.markdown(response_text)
-                        
-                        # Display sources
-                        sources_text = "No sources found."
-                        if response.get("sources", []):
-                            sources_text = format_sources(response["sources"])
-                            with st.expander("Sources"):
-                                st.markdown(sources_text)
-                        
-                        # Display text chunks
-                        chunks_text = "No text chunks available."
-                        if response.get("contexts", []):
-                            chunks_text = format_chunks(response.get("contexts", []))
-                            with st.expander("Text Chunks Used"):
-                                st.markdown(chunks_text)
-                
-                except Exception as e:
-                    st.error(f"Error generating response: {str(e)}")
-                    sources_text = "No sources available due to error."
-                    chunks_text = "No text chunks available due to error."
-                    response_text = f"I encountered an error while processing your request: {str(e)}"
-                    st.markdown(response_text)
-                
-                # Add assistant response to chat history
-                st.session_state.messages.append({
-                    "role": "assistant", 
-                    "content": response_text,
-                    "sources": sources_text,
-                    "chunks": chunks_text
-                })
+        # Generate embeddings
+        embedded_chunks = embeddings_manager.generate_embeddings(chunks)
+        
+        # Store in Pinecone
+        pinecone_manager.upsert_vectors(embedded_chunks)
+        logger.info("Stored vectors in Pinecone")
+        
+        return embedded_chunks
+    except Exception as e:
+        logger.error(f"Error processing document: {str(e)}")
+        raise
 
-# Tab 2: Upload Documents
-with tab2:
-    st.header("Upload Documents")
-    st.write("Upload documents to be processed and added to the knowledge base.")
-    
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        # File uploader
-        uploaded_files = st.file_uploader(
-            "Upload documents (PDF, DOCX, PPTX, CSV, TXT, JSON)", 
-            accept_multiple_files=True,
-            type=["pdf", "docx", "pptx", "csv", "txt", "json"]
+def query_document(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    """Query the document using RAG."""
+    try:
+        # Generate query embedding
+        query_embedding = embeddings_manager.generate_query_embedding(query)
+        
+        # Search in Pinecone
+        results = pinecone_manager.similarity_search(query_embedding, top_k=top_k)
+        
+        # Format context
+        context = "\n\n".join([r["metadata"].get("text", "") for r in results])
+        
+        # Get appropriate prompt template based on document language
+        template = get_prompt_template(context)
+        prompt = ChatPromptTemplate.from_template(template)
+        
+        # Create the RAG chain with the appropriate prompt
+        rag_chain = (
+            {"context": lambda x: x["context"], "question": RunnablePassthrough()}
+            | prompt
+            | llm
+            | StrOutputParser()
         )
-    
-    with col2:
-        st.info("""
-        **Supported File Types:**
-        - PDF (.pdf)
-        - Word Documents (.docx)
-        - PowerPoint (.pptx)
-        - CSV (.csv)
-        - Text Files (.txt)
-        - JSON (.json)
-        """)
-    
-    if uploaded_files:
-        if st.button("Process Documents"):
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            total_files = len(uploaded_files)
-            for i, uploaded_file in enumerate(uploaded_files):
-                status_text.text(f"Processing {uploaded_file.name}...")
-                
-                # Process file
-                text_chunks = document_processor.process_uploaded_file(uploaded_file)
-                
-                # Generate embeddings
-                embedded_chunks = embeddings_manager.generate_embeddings(text_chunks)
-                
-                # Store in Pinecone
-                pinecone_manager.upsert_vectors(embedded_chunks)
-                
-                # Update progress
-                progress_bar.progress((i + 1) / total_files)
-                status_text.text(f"Processed {uploaded_file.name}: {len(text_chunks)} chunks created")
-            
-            status_text.text("All documents processed successfully!")
-            st.success(f"✅ Successfully processed {total_files} documents!")
-    
-    # Directory processing (for local development)
-    st.header("Process Local Directory")
-    st.write("For local development: Process a directory of documents.")
-    
-    dir_path = st.text_input("Directory path")
-    
-    if dir_path and st.button("Process Directory"):
-        if os.path.isdir(dir_path):
-            with st.spinner("Processing directory..."):
-                # Process documents
-                text_chunks = document_processor.batch_process_directory(dir_path)
-                st.write(f"Processed {len(text_chunks)} text chunks")
-                
-                # Generate embeddings
-                embedded_chunks = embeddings_manager.generate_embeddings(text_chunks)
-                st.write(f"Generated embeddings for {len(embedded_chunks)} chunks")
-                
-                # Store in Pinecone
-                pinecone_manager.upsert_vectors(embedded_chunks)
-                st.success("Directory processed successfully!")
-        else:
-            st.error("Directory not found")
+        
+        # Generate response using RAG chain
+        response = rag_chain.invoke({
+            "context": context,
+            "question": query
+        })
+        
+        return {
+            "response": response,
+            "sources": results
+        }
+    except Exception as e:
+        logger.error(f"Error querying document: {str(e)}")
+        raise
 
-# Footer
-st.markdown("---")
-st.markdown("Built with ❤️ using LangChain, OpenAI, and Pinecone")
+# Streamlit UI
+st.title("Document RAG System")
+
+# Initialize session state for processed documents and language
+if 'processed_documents' not in st.session_state:
+    st.session_state.processed_documents = set()
+if 'document_language' not in st.session_state:
+    st.session_state.document_language = 'en'
+
+# File upload
+uploaded_file = st.file_uploader("Upload a document", type=["pdf", "docx", "txt"])
+if uploaded_file:
+    # Save uploaded file
+    file_path = os.path.join("uploads", uploaded_file.name)
+    os.makedirs("uploads", exist_ok=True)
+    
+    # Check if document was already processed
+    if file_path not in st.session_state.processed_documents:
+        with open(file_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        
+        # Process document
+        with st.spinner("Processing document..."):
+            chunks = process_document(file_path)
+            st.session_state.processed_documents.add(file_path)
+            st.success(f"Processed {len(chunks)} chunks from document")
+    else:
+        st.info("Document already processed. You can ask questions about it.")
+
+# Query interface
+query = st.text_input("Ask a question about the document")
+if query:
+    if not st.session_state.processed_documents:
+        st.warning("Please upload a document first.")
+    else:
+        with st.spinner("Searching..."):
+            result = query_document(query)
+            st.write("Answer:", result["response"])
+            
+            # Show sources in an expandable section
+            with st.expander("Show Sources", expanded=False):
+                for source in result["sources"]:
+                    # Safely get text from metadata with a default value
+                    source_text = source.get('metadata', {}).get('text', 'No text available')
+                    score = source.get('score', 0.0)
+                    st.write(f"- {source_text[:200]}... (Score: {score:.2f})")
