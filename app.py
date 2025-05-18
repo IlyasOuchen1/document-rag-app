@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from document_processor import DocumentProcessor
 from embeddings import EmbeddingsManager
 from pinecone_manager import PineconeManager
+from external_search import ExternalSearchManager
 from langchain_openai import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
 from langchain.schema.output_parser import StrOutputParser
@@ -27,6 +28,7 @@ load_dotenv()
 document_processor = DocumentProcessor()
 embeddings_manager = EmbeddingsManager()
 pinecone_manager = PineconeManager()
+external_search_manager = ExternalSearchManager()
 
 # Initialize LangChain components
 llm = ChatOpenAI(
@@ -74,27 +76,22 @@ def get_prompt_template(text: str) -> str:
     """Detect language and return appropriate prompt template."""
     try:
         lang = detect(text)
-        return prompt_templates.get(lang, prompt_templates['en'])  # Default to English if language not supported
+        return prompt_templates.get(lang, prompt_templates['en'])
     except:
-        return prompt_templates['en']  # Default to English if detection fails
+        return prompt_templates['en']
 
 def process_document(file_path: str) -> List[Dict[str, Any]]:
     """Process a document and return chunks with embeddings."""
     try:
-        # Process document
         chunks = document_processor.process_file(file_path)
         logger.info(f"Processed document into {len(chunks)} chunks")
         
-        # Detect language from first chunk
         if chunks:
             doc_language = detect(chunks[0]['text'])
             st.session_state.document_language = doc_language
             logger.info(f"Detected document language: {doc_language}")
         
-        # Generate embeddings
         embedded_chunks = embeddings_manager.generate_embeddings(chunks)
-        
-        # Store in Pinecone
         pinecone_manager.upsert_vectors(embedded_chunks)
         logger.info("Stored vectors in Pinecone")
         
@@ -103,23 +100,33 @@ def process_document(file_path: str) -> List[Dict[str, Any]]:
         logger.error(f"Error processing document: {str(e)}")
         raise
 
-def query_document(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+def query_document(query: str, search_mode: str = "internal", top_k: int = 5) -> List[Dict[str, Any]]:
     """Query the document using RAG."""
     try:
-        # Generate query embedding
-        query_embedding = embeddings_manager.generate_query_embedding(query)
+        context_parts = []
+        sources = []
+
+        # Recherche interne
+        if search_mode in ["internal", "both"]:
+            query_embedding = embeddings_manager.generate_query_embedding(query)
+            internal_results = pinecone_manager.similarity_search(query_embedding, top_k=top_k)
+            context_parts.extend([r["metadata"].get("text", "") for r in internal_results])
+            sources.extend(internal_results)
+
+        # Recherche externe
+        if search_mode in ["external", "both"]:
+            external_results = external_search_manager.search_all_sources(query, num_results=top_k)
+            context_parts.extend([r["text"] for r in external_results])
+            sources.extend(external_results)
+
+        # Combiner les contextes
+        context = "\n\n".join(context_parts)
         
-        # Search in Pinecone
-        results = pinecone_manager.similarity_search(query_embedding, top_k=top_k)
-        
-        # Format context
-        context = "\n\n".join([r["metadata"].get("text", "") for r in results])
-        
-        # Get appropriate prompt template based on document language
+        # Obtenir le template approprié
         template = get_prompt_template(context)
         prompt = ChatPromptTemplate.from_template(template)
         
-        # Create the RAG chain with the appropriate prompt
+        # Créer la chaîne RAG
         rag_chain = (
             {"context": lambda x: x["context"], "question": RunnablePassthrough()}
             | prompt
@@ -127,7 +134,7 @@ def query_document(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
             | StrOutputParser()
         )
         
-        # Generate response using RAG chain
+        # Générer la réponse
         response = rag_chain.invoke({
             "context": context,
             "question": query
@@ -135,7 +142,7 @@ def query_document(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         
         return {
             "response": response,
-            "sources": results
+            "sources": sources
         }
     except Exception as e:
         logger.error(f"Error querying document: {str(e)}")
@@ -277,6 +284,7 @@ with st.sidebar:
     - Ask questions about the content
     - Get AI-powered responses
     - View source references
+    - Search in external sources
     """)
     st.markdown("---")
     st.markdown("### Supported Languages")
@@ -319,14 +327,27 @@ st.markdown("</div>", unsafe_allow_html=True)
 # Query section
 st.markdown("<div class='query-section'>", unsafe_allow_html=True)
 st.markdown("### 💭 Ask Questions")
-query = st.text_input("Enter your question about the document", key="query_input")
+
+# Search mode selection
+search_mode = st.radio(
+    "Select search mode:",
+    ["internal", "external", "both"],
+    format_func=lambda x: {
+        "internal": "📚 Internal (Uploaded Documents)",
+        "external": "🌐 External (Web & Wikipedia)",
+        "both": "🔄 Both Sources"
+    }[x],
+    horizontal=True
+)
+
+query = st.text_input("Enter your question", key="query_input")
 
 if query:
-    if not st.session_state.processed_documents:
-        st.warning("⚠️ Please upload a document first.")
+    if search_mode in ["internal", "both"] and not st.session_state.processed_documents:
+        st.warning("⚠️ Please upload a document first for internal search.")
     else:
         with st.spinner("🔍 Searching for relevant information..."):
-            result = query_document(query)
+            result = query_document(query, search_mode=search_mode)
             
             st.markdown("<div class='response-section'>", unsafe_allow_html=True)
             st.markdown("### 📝 Response")
@@ -334,13 +355,27 @@ if query:
             
             with st.expander("🔍 View Sources", expanded=False):
                 for source in result["sources"]:
-                    source_text = source.get('metadata', {}).get('text', 'No text available')
-                    score = source.get('score', 0.0)
-                    st.markdown(f"""
-                    <div style='background-color: #3d3d3d; padding: 1rem; border-radius: 5px; margin: 0.5rem 0; border: 1px solid #4d4d4d;'>
-                        <p style='margin: 0; color: #ffffff;'>{source_text[:200]}...</p>
-                        <p style='margin: 0.5rem 0 0 0; color: #888888;'>Relevance Score: {score:.2f}</p>
-                    </div>
-                    """, unsafe_allow_html=True)
+                    if "source" in source.get("metadata", {}):
+                        # Source externe
+                        source_text = source.get("text", "No text available")
+                        source_type = source["metadata"]["source"]
+                        source_url = source["metadata"].get("url", "")
+                        st.markdown(f"""
+                        <div style='background-color: #3d3d3d; padding: 1rem; border-radius: 5px; margin: 0.5rem 0; border: 1px solid #4d4d4d;'>
+                            <p style='margin: 0; color: #ffffff;'>{source_text[:200]}...</p>
+                            <p style='margin: 0.5rem 0 0 0; color: #888888;'>Source: {source_type}</p>
+                            <p style='margin: 0.5rem 0 0 0; color: #888888;'><a href='{source_url}' target='_blank'>View Source</a></p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        # Source interne
+                        source_text = source.get("metadata", {}).get("text", "No text available")
+                        score = source.get("score", 0.0)
+                        st.markdown(f"""
+                        <div style='background-color: #3d3d3d; padding: 1rem; border-radius: 5px; margin: 0.5rem 0; border: 1px solid #4d4d4d;'>
+                            <p style='margin: 0; color: #ffffff;'>{source_text[:200]}...</p>
+                            <p style='margin: 0.5rem 0 0 0; color: #888888;'>Relevance Score: {score:.2f}</p>
+                        </div>
+                        """, unsafe_allow_html=True)
             st.markdown("</div>", unsafe_allow_html=True)
 st.markdown("</div>", unsafe_allow_html=True)
